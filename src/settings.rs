@@ -95,10 +95,79 @@ impl Locale {
     }
 }
 
+/// Country whose IP is sent in `X-Forwarded-For` when signing in to xCloud, so accounts in
+/// countries without Xbox Cloud Gaming can still get a streaming token (same approach and IPs as
+/// Better xCloud's "Bypass region restriction"). `Off` sends nothing, as the original client does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RegionBypass {
+    #[default]
+    Off,
+    Brazil,
+    UnitedStates,
+    Japan,
+    Korea,
+    Poland,
+}
+
+impl RegionBypass {
+    pub const ALL: [RegionBypass; 6] = [
+        Self::Off,
+        Self::Brazil,
+        Self::UnitedStates,
+        Self::Japan,
+        Self::Korea,
+        Self::Poland,
+    ];
+
+    /// The IP sent as `X-Forwarded-For`, or `None` when disabled.
+    pub fn forwarded_ip(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Brazil => Some("169.150.198.66"),
+            Self::UnitedStates => Some("143.244.47.65"),
+            Self::Japan => Some("138.199.21.239"),
+            Self::Korea => Some("121.125.60.151"),
+            Self::Poland => Some("45.134.212.66"),
+        }
+    }
+
+    /// Short country code shown in the settings row (`None` for `Off`, which is localized).
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            Self::Brazil => Some("BR"),
+            Self::UnitedStates => Some("US"),
+            Self::Japan => Some("JP"),
+            Self::Korea => Some("KR"),
+            Self::Poland => Some("PL"),
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|&value| value == self)
+            .unwrap_or(0)
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub locale: Locale,
+    /// Country to present to xCloud at sign-in (see [`RegionBypass`]).
+    pub region_bypass: RegionBypass,
+    /// xCloud server region name (e.g. `"BrazilSouth"`) to stream from instead of the default
+    /// one Microsoft assigns. `None` = automatic.
+    pub preferred_server: Option<String>,
     /// Shows internal stream/session state on the `Streaming` screen. Off by default.
     pub show_stream_debug_info: bool,
     pub game_profiles: HashMap<String, GameProfile>,
@@ -129,6 +198,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             locale: Locale::default(),
+            region_bypass: RegionBypass::default(),
+            preferred_server: None,
             show_stream_debug_info: false,
             game_profiles: HashMap::new(),
         }
@@ -136,6 +207,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Pushes the region options to the auth layer, which reads them on the next sign-in.
+    pub fn apply_region_config(&self) {
+        crate::api_xbox::auth::set_region_config(crate::api_xbox::auth::RegionConfig {
+            forwarded_ip: self.region_bypass.forwarded_ip(),
+            preferred_server: self.preferred_server.clone(),
+        });
+    }
+
     pub fn game_profile(&self, title_id: &str) -> Option<&GameProfile> {
         self.game_profiles.get(title_id)
     }

@@ -19,6 +19,9 @@ pub(crate) struct Service {
     pub(crate) avatar: Option<Arc<TitleImage>>,
     pub(crate) gamertag: Option<String>,
     pub(crate) gamerscore: Option<String>,
+    /// xCloud server regions offered at the last sign-in, and the one in use.
+    pub(crate) cloud_regions: Vec<String>,
+    pub(crate) cloud_region: Option<String>,
     pub(crate) logo: Arc<TitleImage>,
 }
 
@@ -43,6 +46,8 @@ impl Service {
             avatar: None,
             gamertag: None,
             gamerscore: None,
+            cloud_regions: Vec::new(),
+            cloud_region: None,
             logo: image::load_bundled_logo(),
         }
     }
@@ -54,6 +59,8 @@ impl Service {
         self.avatar = None;
         self.gamertag = None;
         self.gamerscore = None;
+        self.cloud_regions.clear();
+        self.cloud_region = None;
         self.restart_catalog_worker();
     }
 

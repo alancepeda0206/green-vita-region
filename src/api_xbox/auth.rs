@@ -29,6 +29,38 @@ pub struct StreamingCredentials {
     pub home: EndpointCredentials,
     pub cloud: EndpointCredentials,
     pub cloud_f2p: Option<EndpointCredentials>,
+    /// Every xCloud server region the account may use, as returned at sign-in.
+    pub cloud_regions: Vec<String>,
+    /// The region actually selected for `cloud`.
+    pub cloud_region: String,
+}
+
+/// Region options read when requesting streaming tokens; set from user settings.
+#[derive(Debug, Clone, Default)]
+pub struct RegionConfig {
+    /// Sent as `X-Forwarded-For` on `/v2/login/user` so xCloud treats the request as coming
+    /// from a supported country.
+    pub forwarded_ip: Option<&'static str>,
+    /// Preferred server region name (case-insensitive); falls back to the default if missing.
+    pub preferred_server: Option<String>,
+}
+
+static REGION_CONFIG: std::sync::RwLock<RegionConfig> = std::sync::RwLock::new(RegionConfig {
+    forwarded_ip: None,
+    preferred_server: None,
+});
+
+pub fn set_region_config(config: RegionConfig) {
+    if let Ok(mut current) = REGION_CONFIG.write() {
+        *current = config;
+    }
+}
+
+fn region_config() -> RegionConfig {
+    REGION_CONFIG
+        .read()
+        .map(|config| config.clone())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,24 +188,45 @@ struct OfferingSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 struct StreamingRegion {
+    #[serde(default)]
+    name: String,
     #[serde(rename = "baseUri")]
     base_uri: String,
     #[serde(rename = "isDefault")]
     is_default: bool,
 }
 
-impl StreamingTokenResponse {
-    fn into_credentials(self) -> Result<EndpointCredentials> {
-        let region = self
-            .offering_settings
-            .regions
-            .into_iter()
-            .find(|region| region.is_default)
-            .context("streaming token response had no default region")?;
+/// The result of one `/v2/login/user` exchange.
+#[derive(Debug, Clone)]
+struct OfferingLogin {
+    credentials: EndpointCredentials,
+    region_names: Vec<String>,
+    selected_region: String,
+}
 
-        Ok(EndpointCredentials {
-            host: region.base_uri,
-            token: self.gs_token,
+impl StreamingTokenResponse {
+    /// Picks `preferred` (matched case-insensitively by name) when the offering lists it,
+    /// otherwise the region Microsoft marks as default.
+    fn into_login(self, preferred: Option<&str>) -> Result<OfferingLogin> {
+        let regions = self.offering_settings.regions;
+        let region_names = regions.iter().map(|region| region.name.clone()).collect();
+        let preferred_index = preferred.and_then(|wanted| {
+            regions
+                .iter()
+                .position(|region| region.name.eq_ignore_ascii_case(wanted))
+        });
+        let index = preferred_index
+            .or_else(|| regions.iter().position(|region| region.is_default))
+            .context("streaming token response had no default region")?;
+        let region = &regions[index];
+
+        Ok(OfferingLogin {
+            credentials: EndpointCredentials {
+                host: region.base_uri.clone(),
+                token: self.gs_token,
+            },
+            region_names,
+            selected_region: region.name.clone(),
         })
     }
 }
@@ -477,22 +530,34 @@ impl MsalAuth {
         &self,
         gssv_token: &str,
         offering: &str,
-    ) -> Result<EndpointCredentials> {
+        region: &RegionConfig,
+        use_preferred_server: bool,
+    ) -> Result<OfferingLogin> {
         let body = serde_json::json!({
             "token": gssv_token,
             "offeringId": offering,
         });
 
+        let mut headers = vec![("x-gssv-client", "XboxComBrowser")];
+        if let Some(ip) = region.forwarded_ip {
+            headers.push(("X-Forwarded-For", ip));
+        }
+
         let response: StreamingTokenResponse = self
             .post_json(
                 format!("https://{offering}.gssv-play-prod.xboxlive.com/v2/login/user"),
-                &[("x-gssv-client", "XboxComBrowser")],
+                &headers,
                 &body,
                 &format!("streaming token (offering {offering})"),
             )
             .await?;
 
-        response.into_credentials()
+        let preferred = if use_preferred_server {
+            region.preferred_server.as_deref()
+        } else {
+            None
+        };
+        response.into_login(preferred)
     }
 
     pub async fn fetch_streaming_credentials(&mut self) -> Result<StreamingCredentials> {
@@ -503,21 +568,33 @@ impl MsalAuth {
             .await?
             .token;
 
-        let home = self.streaming_token(&gssv_token, "xhome").await?;
+        let region = region_config();
 
-        let primary = self.streaming_token(&gssv_token, "xgpuweb").await;
-        let f2p = self.streaming_token(&gssv_token, "xgpuwebf2p").await;
+        // Remote Play uses its own region list, so only the IP override applies to it.
+        let home = self
+            .streaming_token(&gssv_token, "xhome", &region, false)
+            .await?
+            .credentials;
+
+        let primary = self
+            .streaming_token(&gssv_token, "xgpuweb", &region, true)
+            .await;
+        let f2p = self
+            .streaming_token(&gssv_token, "xgpuwebf2p", &region, true)
+            .await;
 
         let (cloud, cloud_f2p) = match (primary, f2p) {
-            (Ok(cloud), f2p) => (cloud, f2p.ok()),
+            (Ok(cloud), f2p) => (cloud, f2p.ok().map(|login| login.credentials)),
             (Err(_), Ok(f2p)) => (f2p, None),
             (Err(error), Err(_)) => return Err(error),
         };
 
         Ok(StreamingCredentials {
             home,
-            cloud,
+            cloud: cloud.credentials,
             cloud_f2p,
+            cloud_regions: cloud.region_names,
+            cloud_region: cloud.selected_region,
         })
     }
 

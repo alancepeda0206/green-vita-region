@@ -59,7 +59,7 @@ pub(crate) enum AppState {
 }
 
 impl AppState {
-    fn keeps_stream_alive(&self) -> bool {
+    pub(crate) fn keeps_stream_alive(&self) -> bool {
         match self {
             Self::Streaming(_) => true,
             Self::Settings { return_to, .. } => return_to.keeps_stream_alive(),

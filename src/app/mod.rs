@@ -35,11 +35,14 @@ pub struct App {
     pub(crate) title_initial_overlay: Option<TitleInitialOverlay>,
     pub(crate) title_search_query: String,
     pub(crate) title_search_requested: bool,
+    /// Region settings changed; credentials are re-fetched when leaving Settings.
+    pub(crate) region_changed: bool,
 }
 
 impl App {
     pub fn new() -> Result<Self> {
         let settings = Settings::load();
+        settings.apply_region_config();
         let service = Service::new(settings.locale.as_str());
 
         Ok(Self {
@@ -49,6 +52,7 @@ impl App {
             title_initial_overlay: None,
             title_search_query: String::new(),
             title_search_requested: false,
+            region_changed: false,
             settings,
         })
     }

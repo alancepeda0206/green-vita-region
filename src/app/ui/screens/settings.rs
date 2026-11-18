@@ -4,6 +4,7 @@ use crate::app::ui::header::show_header_row;
 use crate::app::ui::theme::Theme;
 use crate::app::ui::widgets::smooth_scroll_area;
 use crate::i18n::{I18n, arg_string};
+use crate::settings::RegionBypass;
 use crate::{App, AppCommand, AppState, Locale};
 use anyhow::Result;
 use fluent_bundle::FluentArgs;
@@ -16,6 +17,8 @@ pub enum Command {
     SetRearTouchEnabled { title_id: String, enabled: bool },
     SetFrontTouchAuxiliaryButtons { title_id: String, enabled: bool },
     SetShowStreamDebugInfo(bool),
+    SetRegionBypass(RegionBypass),
+    SetPreferredServer(Option<String>),
 }
 
 #[derive(Clone)]
@@ -26,7 +29,70 @@ enum SettingsRow {
     GameRearTouch { title_id: String, enabled: bool },
     GameFrontTouchAuxiliary { title_id: String, enabled: bool },
     StreamDebug(bool),
+    RegionBypass,
+    Server,
     Back,
+}
+
+/// `None` (automatic) followed by every server offered at sign-in. A saved preference that is
+/// not in the current list is kept so cycling never silently drops it.
+fn server_options(app: &App) -> Vec<Option<String>> {
+    let mut options = vec![None];
+    options.extend(app.service.cloud_regions.iter().cloned().map(Some));
+    if let Some(saved) = &app.settings.preferred_server {
+        if !options
+            .iter()
+            .flatten()
+            .any(|name| name.eq_ignore_ascii_case(saved))
+        {
+            options.push(Some(saved.clone()));
+        }
+    }
+    options
+}
+
+fn cycle_server(app: &App, forward: bool) -> Option<String> {
+    let options = server_options(app);
+    let current = options
+        .iter()
+        .position(|option| match (option, &app.settings.preferred_server) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        })
+        .unwrap_or(0);
+    let next = if forward {
+        move_next(current, options.len())
+    } else {
+        move_prev(current, options.len())
+    };
+    options[next].clone()
+}
+
+fn region_bypass_label(i18n: &I18n, bypass: RegionBypass) -> String {
+    let value = match bypass.code() {
+        None => i18n.text("settings-region-off"),
+        Some(code) => format!("{} ({code})", i18n.text(country_key(bypass))),
+    };
+    format!("{}:  < {value} >", i18n.text("settings-region-bypass"))
+}
+
+fn country_key(bypass: RegionBypass) -> &'static str {
+    match bypass {
+        RegionBypass::Off => "settings-region-off",
+        RegionBypass::Brazil => "country-br",
+        RegionBypass::UnitedStates => "country-us",
+        RegionBypass::Japan => "country-jp",
+        RegionBypass::Korea => "country-kr",
+        RegionBypass::Poland => "country-pl",
+    }
+}
+
+fn server_label(i18n: &I18n, preferred: Option<&str>) -> String {
+    let value = preferred
+        .map(str::to_owned)
+        .unwrap_or_else(|| i18n.text("settings-server-auto"));
+    format!("{}:  < {value} >", i18n.text("settings-server"))
 }
 
 fn settings_rows(app: &App) -> Vec<SettingsRow> {
@@ -43,6 +109,8 @@ fn settings_rows(app: &App) -> Vec<SettingsRow> {
     if *locale_expanded {
         rows.extend(Locale::ALL.iter().copied().map(SettingsRow::LocaleOption));
     }
+    rows.push(SettingsRow::RegionBypass);
+    rows.push(SettingsRow::Server);
     if let Some(title_id) = title_id.clone() {
         let enabled = app
             .settings
@@ -127,6 +195,35 @@ pub(crate) fn show(ctx: &egui::Context, app: &App, commands: &mut Vec<AppCommand
                         row_index += 1;
                     }
                 }
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.heading(
+                    egui::RichText::new(i18n.text("settings-region")).color(theme.text_bright),
+                );
+                if focus_row(
+                    ui,
+                    selected_index == row_index,
+                    region_bypass_label(&i18n, app.settings.region_bypass),
+                ) {
+                    commands
+                        .push(Command::SetRegionBypass(app.settings.region_bypass.next()).into());
+                }
+                row_index += 1;
+                if focus_row(
+                    ui,
+                    selected_index == row_index,
+                    server_label(&i18n, app.settings.preferred_server.as_deref()),
+                ) {
+                    commands.push(Command::SetPreferredServer(cycle_server(app, true)).into());
+                }
+                row_index += 1;
+                if let Some(current) = &app.service.cloud_region {
+                    let mut args = FluentArgs::new();
+                    args.set("server", arg_string(current.as_str()));
+                    ui.colored_label(theme.text, i18n.text_with("settings-server-current", args));
+                }
+                ui.colored_label(theme.text, i18n.text("settings-region-hint"));
 
                 if let Some(title_id) = title_id.clone() {
                     let swap_shoulders_and_triggers = app
@@ -349,7 +446,29 @@ impl App {
                     *selected = move_next(*selected, rows.len());
                 }
             }
-            InputCommand::MoveLeft | InputCommand::MoveRight => {}
+            InputCommand::MoveLeft | InputCommand::MoveRight => {
+                let forward = matches!(command, InputCommand::MoveRight);
+                let selected = match &self.state {
+                    AppState::Settings { selected, .. } => *selected,
+                    _ => return Ok(()),
+                };
+                match rows.get(selected) {
+                    Some(SettingsRow::RegionBypass) => {
+                        let current = self.settings.region_bypass;
+                        let next = if forward {
+                            current.next()
+                        } else {
+                            current.prev()
+                        };
+                        self.handle_settings_command(Command::SetRegionBypass(next))?;
+                    }
+                    Some(SettingsRow::Server) => {
+                        let next = cycle_server(self, forward);
+                        self.handle_settings_command(Command::SetPreferredServer(next))?;
+                    }
+                    _ => {}
+                }
+            }
             InputCommand::Confirm => self.confirm_settings_row(&rows)?,
             InputCommand::Back => self.leave_settings(),
         }
@@ -395,6 +514,14 @@ impl App {
             SettingsRow::StreamDebug(enabled) => {
                 return self.handle_settings_command(Command::SetShowStreamDebugInfo(!enabled));
             }
+            SettingsRow::RegionBypass => {
+                let next = self.settings.region_bypass.next();
+                return self.handle_settings_command(Command::SetRegionBypass(next));
+            }
+            SettingsRow::Server => {
+                let next = cycle_server(self, true);
+                return self.handle_settings_command(Command::SetPreferredServer(next));
+            }
             SettingsRow::Back => {}
         }
 
@@ -405,7 +532,16 @@ impl App {
     fn leave_settings(&mut self) {
         let state = std::mem::replace(&mut self.state, AppState::TitleList { selected: 0 });
         if let AppState::Settings { return_to, .. } = state {
-            self.set_state(*return_to);
+            // A new region needs a new streaming token. Never interrupt a live stream for it;
+            // the change then applies the next time Settings is left outside a stream. When not
+            // signed in yet, the next sign-in picks the new settings up on its own.
+            let signed_in = self.service.cloud_region.is_some();
+            if self.region_changed && signed_in && !return_to.keeps_stream_alive() {
+                self.region_changed = false;
+                self.load_credentials();
+            } else {
+                self.set_state(*return_to);
+            }
         } else {
             self.state = state;
         }
@@ -469,6 +605,22 @@ impl App {
             Command::SetShowStreamDebugInfo(enabled) => {
                 self.settings.show_stream_debug_info = enabled;
                 self.settings.save();
+            }
+            Command::SetRegionBypass(bypass) => {
+                if self.settings.region_bypass != bypass {
+                    self.settings.region_bypass = bypass;
+                    self.settings.apply_region_config();
+                    self.settings.save();
+                    self.region_changed = true;
+                }
+            }
+            Command::SetPreferredServer(server) => {
+                if self.settings.preferred_server != server {
+                    self.settings.preferred_server = server;
+                    self.settings.apply_region_config();
+                    self.settings.save();
+                    self.region_changed = true;
+                }
             }
         }
 
